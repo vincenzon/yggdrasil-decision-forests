@@ -1,0 +1,33 @@
+{
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "REMOTE_USER": "${localEnv:USER}",
+      "REMOTE_UID": "${localEnv:REMOTE_UID:1000}",
+      "REMOTE_GID": "${localEnv:REMOTE_GID:1000}"
+    }
+  },
+  "mounts": [
+    "type=bind,source=/home/${localEnv:USER}/.ssh,target=/home/${localEnv:USER}/.ssh",
+    "source=clickhouse-radsul,target=/var/lib/clickhouse,type=volume"
+  ],
+
+  "remoteUser": "${localEnv:USER}",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker",
+        "GitHub.copilot",
+        "ms-vscode.cpptools",
+        "BazelBuild.vscode-bazel"
+      ]
+    }
+  },
+
+  "postCreateCommand": "/tmp/postCreateCmd.sh"
+}
