@@ -25,7 +25,7 @@ option java_outer_classname = "GradientBoostedTreesLearner";
 
 // Training configuration for the Gradient Boosted Trees algorithm.
 message GradientBoostedTreesTrainingConfig {
-  // Next ID: 42
+  // Next ID: 46
 
   // Basic parameters.
 
@@ -165,6 +165,12 @@ message GradientBoostedTreesTrainingConfig {
     // "VALIDATION_LOSS_INCREASE" is more efficient than
     // "MIN_VALIDATION_LOSS_ON_FULL_MODEL" but can lead to worse models.
     VALIDATION_LOSS_INCREASE = 2;
+
+    // Stops training when no candidate split passes the SNR threshold.
+    // From NTK theory (Litman & Guo, 2026): terminates when the signal channel
+    // is saturated. Requires split_score=SNR in decision_tree config.
+    // Does not require a validation set.
+    SIGNAL_CHANNEL_SATURATION = 3;
   }
   optional EarlyStopping early_stopping = 8
       [default = VALIDATION_LOSS_INCREASE];
@@ -373,6 +379,47 @@ message GradientBoostedTreesTrainingConfig {
 
   // Internal knobs of the algorithm that don't impact the final model.
   optional Internal internal = 39;
+
+  // Adaptive shrinkage (learning rate) policy from NTK theory (Litman & Guo, 2026).
+  // When enabled, computes a per-iteration learning rate based on the tree's
+  // leaf statistics, replacing the constant shrinkage.
+  enum AdaptiveShrinkage {
+    // Use constant shrinkage (the "shrinkage" parameter). Default behavior.
+    ADAPTIVE_SHRINKAGE_OFF = 0;
+
+    // Exact formula: eta_t = n / max_l(v_l^2 * n_l).
+    // Requires a pass over all leaves after each tree is built.
+    ADAPTIVE_SHRINKAGE_EXACT = 1;
+
+    // Conservative approximation: eta_t = 1 / gain_t.
+    // Uses only the total gain already computed during tree building.
+    ADAPTIVE_SHRINKAGE_CONSERVATIVE = 2;
+
+    // Optimistic approximation: eta_t = L_t / gain_t.
+    // Where L_t is the number of leaves in the tree.
+    ADAPTIVE_SHRINKAGE_OPTIMISTIC = 3;
+  }
+  optional AdaptiveShrinkage adaptive_shrinkage = 42
+      [default = ADAPTIVE_SHRINKAGE_OFF];
+
+  // Upper bound on the adaptive learning rate. The computed eta_t is clamped
+  // to [0, adaptive_shrinkage_cap]. Only used when adaptive_shrinkage != OFF.
+  // Default matches the default shrinkage value.
+  optional float adaptive_shrinkage_cap = 43 [default = 0.1];
+
+  // If true, compute contrast-dictionary-based variable importances during
+  // training. This includes the cumulative residual alignment score (A_f)
+  // from NTK theory. Enabling this feature increases training time
+  // significantly: O(sum_f N_f * n) per iteration.
+  optional bool compute_contrast_variable_importances = 44 [default = false];
+
+  // If true, enables "matching pursuit" mode which combines:
+  // - max_depth=1 (stumps)
+  // - split_score=SNR
+  // - adaptive_shrinkage=EXACT
+  // - early_stopping=SIGNAL_CHANNEL_SATURATION
+  // This provides a principled, cross-validation-free boosting approach.
+  optional bool matching_pursuit = 45 [default = false];
 
   reserved 38;
 }

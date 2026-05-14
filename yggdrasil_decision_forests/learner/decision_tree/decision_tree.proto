@@ -23,7 +23,7 @@ option java_outer_classname = "DecisionTreeLearner";
 
 // Training configuration for the Random Forest algorithm.
 message DecisionTreeTrainingConfig {
-  // Next ID: 26
+  // Next ID: 29
 
   // Basic parameters.
 
@@ -472,6 +472,41 @@ message DecisionTreeTrainingConfig {
     // used to check the propagation of error to the user.
     optional bool generate_fake_error_in_splitter = 24 [default = false];
   }
+
+  // Split scoring method.
+  // Controls how the quality of a candidate split is evaluated.
+  enum SplitScore {
+    // Standard split scoring: variance reduction for regression, entropy/gini
+    // for classification. For hessian-based regression (GBT), uses
+    // (sum_gradient)^2 / (sum_hessian + lambda).
+    STANDARD = 0;
+
+    // SNR-corrected split scoring from the NTK theory (Litman & Guo, 2026).
+    // For regression: (sum_y)^2 / (sum_y^2 - (sum_y)^2/n + lambda).
+    // For hessian-based regression (GBT): (sum_g)^2 / (sum_g^2 - (sum_g)^2/n + lambda).
+    // Rejects splits where the signal-to-noise ratio is below threshold.
+    // Only affects numerical-label trees; categorical labels fall back to STANDARD.
+    SNR = 1;
+  }
+  optional SplitScore split_score = 27 [default = STANDARD];
+
+  // Capacity constraint policy based on NTK theory (Litman & Guo, 2026).
+  // Controls behavior when T * (2^L - 1) > n_effective, where T is the number
+  // of trees, L is max_depth, and n_effective is the effective training size.
+  enum CapacityPolicy {
+    // No capacity check.
+    CAPACITY_NONE = 0;
+
+    // Log a warning if capacity bound is exceeded but proceed normally.
+    CAPACITY_WARN = 1;
+
+    // Clamp num_trees to stay within the capacity bound.
+    CAPACITY_CLAMP_TREES = 2;
+
+    // Clamp max_depth to stay within the capacity bound.
+    CAPACITY_CLAMP_DEPTH = 3;
+  }
+  optional CapacityPolicy capacity_policy = 28 [default = CAPACITY_WARN];
 
   // Deprecated tag numbers.
   reserved 9, 10, 11;

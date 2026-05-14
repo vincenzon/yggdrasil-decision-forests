@@ -233,6 +233,17 @@ cc_library_ydf(
     }),
 )
 
+cc_library_ydf(
+    name = "contrast_dictionary",
+    srcs = ["contrast_dictionary.cc"],
+    hdrs = ["contrast_dictionary.h"],
+    deps = [
+        "//yggdrasil_decision_forests/dataset:vertical_dataset",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
 # Proto
 # ========
 
@@ -359,6 +370,18 @@ cc_test(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "contrast_dictionary_test",
+    srcs = ["contrast_dictionary_test.cc"],
+    deps = [
+        ":contrast_dictionary",
+        "//yggdrasil_decision_forests/dataset:data_spec_cc_proto",
+        "//yggdrasil_decision_forests/dataset:vertical_dataset",
+        "//yggdrasil_decision_forests/utils:test",
         "@com_google_googletest//:gtest_main",
     ],
 )

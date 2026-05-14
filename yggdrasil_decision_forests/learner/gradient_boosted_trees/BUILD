@@ -18,6 +18,7 @@ cc_library_ydf(
     ],
     hdrs = [
         "gradient_boosted_trees.h",
+        "ntk_utils.h",
     ],
     deps = [
         ":gradient_boosted_trees_cc_proto",
@@ -186,6 +187,18 @@ cc_test(
         "//yggdrasil_decision_forests/utils:test",
         "//yggdrasil_decision_forests/utils:test_utils",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ntk_utils_test",
+    srcs = ["ntk_utils_test.cc"],
+    deps = [
+        ":gradient_boosted_trees",
+        ":gradient_boosted_trees_cc_proto",
+        "//yggdrasil_decision_forests/learner/decision_tree:decision_tree_cc_proto",
+        "//yggdrasil_decision_forests/model/decision_tree",
         "@com_google_googletest//:gtest_main",
     ],
 )

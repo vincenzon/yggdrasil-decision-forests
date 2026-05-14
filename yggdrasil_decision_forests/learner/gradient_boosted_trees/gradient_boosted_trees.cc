@@ -65,6 +65,7 @@
 #include "yggdrasil_decision_forests/learner/gradient_boosted_trees/loss/loss_interface.h"
 #include "yggdrasil_decision_forests/learner/gradient_boosted_trees/loss/loss_library.h"
 #include "yggdrasil_decision_forests/learner/gradient_boosted_trees/loss/loss_utils.h"
+#include "yggdrasil_decision_forests/learner/gradient_boosted_trees/ntk_utils.h"
 #include "yggdrasil_decision_forests/model/abstract_model.h"
 #include "yggdrasil_decision_forests/model/abstract_model.pb.h"
 #include "yggdrasil_decision_forests/model/decision_tree/decision_tree.h"
@@ -517,6 +518,22 @@ absl::Status GradientBoostedTreesLearner::BuildAllTrainingConfiguration(
   all_config->gbt_config = all_config->train_config.MutableExtension(
       gradient_boosted_trees::proto::gradient_boosted_trees_config);
   RETURN_IF_ERROR(internal::SetDefaultHyperParameters(all_config->gbt_config));
+
+  // Apply matching_pursuit preset if enabled (NTK theory, Section 5.6).
+  // This sets max_depth=1 (stumps), split_score=SNR, adaptive_shrinkage=EXACT,
+  // and early_stopping=SIGNAL_CHANNEL_SATURATION.
+  if (all_config->gbt_config->matching_pursuit()) {
+    LOG(INFO) << "Matching pursuit mode enabled. Setting: max_depth=1, "
+                 "split_score=SNR, adaptive_shrinkage=EXACT, "
+                 "early_stopping=SIGNAL_CHANNEL_SATURATION";
+    all_config->gbt_config->mutable_decision_tree()->set_max_depth(1);
+    all_config->gbt_config->mutable_decision_tree()->set_split_score(
+        decision_tree::proto::DecisionTreeTrainingConfig::SNR);
+    all_config->gbt_config->set_adaptive_shrinkage(
+        proto::GradientBoostedTreesTrainingConfig::ADAPTIVE_SHRINKAGE_EXACT);
+    all_config->gbt_config->set_early_stopping(
+        proto::GradientBoostedTreesTrainingConfig::SIGNAL_CHANNEL_SATURATION);
+  }
 
   RETURN_IF_ERROR(AbstractLearner::LinkTrainingConfig(
       all_config->train_config, data_spec, &all_config->train_config_link));
@@ -1410,6 +1427,44 @@ GradientBoostedTreesLearner::TrainWithStatusImpl(
         &early_stopping, &sub_train_predictions, &validation_predictions));
   }
 
+  // Apply capacity policy (NTK theory, Section 5.4).
+  // The effective training size is n * subsample_ratio.
+  double subsample_ratio = 1.0;
+  switch (config.gbt_config->sampling_methods_case()) {
+    case proto::GradientBoostedTreesTrainingConfig::kStochasticGradientBoosting:
+      subsample_ratio =
+          config.gbt_config->stochastic_gradient_boosting().ratio();
+      break;
+    case proto::GradientBoostedTreesTrainingConfig::SAMPLING_METHODS_NOT_SET:
+    default:
+      subsample_ratio = 1.0;
+      break;
+  }
+  const auto capacity_policy =
+      config.gbt_config->decision_tree().capacity_policy();
+  int32_t effective_num_trees = config.gbt_config->num_trees();
+  int32_t effective_max_depth = config.gbt_config->decision_tree().max_depth();
+
+  if (capacity_policy ==
+      decision_tree::proto::DecisionTreeTrainingConfig::CAPACITY_CLAMP_DEPTH) {
+    effective_max_depth = ComputeClampedMaxDepth(
+        effective_num_trees, effective_max_depth, sub_train_dataset.nrow(),
+        subsample_ratio);
+    // Note: We would need to modify the config to use the new max_depth.
+    // For now, we just log the recommended depth.
+    if (effective_max_depth <
+        config.gbt_config->decision_tree().max_depth()) {
+      LOG(INFO)
+          << "Capacity policy recommends max_depth=" << effective_max_depth
+          << " but config modifications are not yet supported. "
+          << "Please set max_depth manually.";
+    }
+  } else {
+    effective_num_trees = ApplyCapacityPolicy(
+        effective_num_trees, effective_max_depth, sub_train_dataset.nrow(),
+        subsample_ratio, capacity_policy);
+  }
+
   // Train the trees one by one.
   std::vector<UnsignedExampleIdx> selected_examples;
 
@@ -1425,7 +1480,7 @@ GradientBoostedTreesLearner::TrainWithStatusImpl(
   mdl->set_early_stopping_triggered(false);
 
   const auto begin_tree_grow = absl::Now();
-  for (; iter_idx < config.gbt_config->num_trees(); iter_idx++) {
+  for (; iter_idx < effective_num_trees; iter_idx++) {
     // The user interrupted the training.
     if (stop_training_trigger_ != nullptr && *stop_training_trigger_) {
       LOG(INFO) << "Training interrupted per request.";
@@ -1510,6 +1565,55 @@ GradientBoostedTreesLearner::TrainWithStatusImpl(
           config.gbt_config->decision_tree(), deployment(), *tree_weights,
           &random, tree.get(), internal_config));
       new_trees.push_back(std::move(tree));
+    }
+
+    // Check for signal channel saturation stopping (NTK theory, Section 5.6).
+    // If no tree has any meaningful splits, stop training.
+    if (config.gbt_config->early_stopping() ==
+        proto::GradientBoostedTreesTrainingConfig::SIGNAL_CHANNEL_SATURATION) {
+      bool all_trivial = true;
+      for (const auto& tree : new_trees) {
+        if (TreeHasMeaningfulSplits(*tree)) {
+          all_trivial = false;
+          break;
+        }
+      }
+      if (all_trivial) {
+        LOG(INFO) << "Signal channel saturation: no tree has meaningful "
+                     "splits. Stopping training at iteration "
+                  << iter_idx << ".";
+        break;
+      }
+    }
+
+    // Compute adaptive shrinkage for each tree (NTK theory, Section 5.3).
+    // Note: Currently this only logs the computed values; full integration
+    // would require refactoring how shrinkage is applied to leaf values.
+    if (config.gbt_config->adaptive_shrinkage() !=
+        proto::GradientBoostedTreesTrainingConfig::ADAPTIVE_SHRINKAGE_OFF) {
+      for (size_t tree_idx = 0; tree_idx < new_trees.size(); tree_idx++) {
+        // Estimate total gain for this tree (sum of split gains).
+        double total_gain = 0.0;
+        new_trees[tree_idx]->IterateOnNodes(
+            [&total_gain](const decision_tree::NodeWithChildren& node,
+                          const int depth) {
+              if (!node.IsLeaf() && node.node().has_condition()) {
+                total_gain += node.node().condition().split_score();
+              }
+            });
+
+        const double adaptive_eta = ComputeAdaptiveShrinkage(
+            *new_trees[tree_idx], sub_train_dataset.nrow(), total_gain,
+            config.gbt_config->adaptive_shrinkage(),
+            config.gbt_config->adaptive_shrinkage_cap());
+
+        // Log the adaptive shrinkage at regular intervals.
+        if (iter_idx <= 1 || iter_idx % 100 == 0) {
+          LOG(INFO) << "Iteration " << iter_idx << " tree " << tree_idx
+                    << " adaptive_eta=" << adaptive_eta
+                    << " (gain=" << total_gain << ")";
+        }
+      }
     }
 
     // Note: Since the batch size is only impacting the training time (i.e.

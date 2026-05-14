@@ -103,6 +103,15 @@ struct FloatSumGradientHessian {
   [[no_unique_address]] std::conditional_t<weighted, float, Empty> sum_weight;
 };
 
+// Extended version with sum of squared gradients for SNR scoring.
+template <bool weighted>
+struct FloatSumGradientHessianSquared {
+  float sum_gradient;
+  float sum_hessian;
+  float sum_squared_gradient;
+  [[no_unique_address]] std::conditional_t<weighted, float, Empty> sum_weight;
+};
+
 template <bool weighted>
 struct SumTrues {
   double sum_trues;
@@ -613,6 +622,34 @@ struct LabelNumericalScoreAccumulator {
 
   double Score() const { return label.VarTimesSumWeights(); }
 
+  // SNR-corrected score from NTK theory (Litman & Guo, 2026).
+  // Formula: (sum_y)^2 / (variance_term + lambda)
+  // Where variance_term = sum_y^2 - (sum_y)^2/n
+  // And lambda is a small regularization term to avoid division by zero.
+  double ScoreSNR(double lambda = 0.0) const {
+    const double n = label.NumObservations();
+    if (n < 2) return 0.0;
+    const double mean_y = label.Mean();
+    const double sum_y = mean_y * n;
+    // VarTimesSumWeights = sum_y^2 - (sum_y)^2/n = variance_term
+    const double variance_term = label.VarTimesSumWeights();
+    const double denominator = variance_term + lambda;
+    if (denominator <= 0.0) return 0.0;
+    return (sum_y * sum_y) / denominator;
+  }
+
+  // Check if the split passes the SNR threshold.
+  // Condition: mean(y)^2 > var(y) / (n - 1)
+  // Equivalent to: (sum_y/n)^2 > sample_variance / (n - 1)
+  bool PassesSnrThreshold() const {
+    const double n = label.NumObservations();
+    if (n < 2) return false;
+    const double mean_y = label.Mean();
+    const double var_y = label.Var();
+    // Threshold: mean^2 > var / (n - 1)
+    return (mean_y * mean_y) > (var_y / (n - 1));
+  }
+
   double WeightedNumExamples() const { return label.NumObservations(); }
 
   void ImportLabelStats(const proto::LabelStatistics& src) {
@@ -772,6 +809,47 @@ struct LabelHessianNumericalScoreAccumulator {
     return numerator * numerator / denominator;
   }
 
+  // SNR-corrected score from NTK theory (Litman & Guo, 2026).
+  // Formula: (sum_g)^2 / (sum_g^2 - (sum_g)^2/n + lambda)
+  // Uses gradient variance in the denominator instead of hessian.
+  double ScoreSNR() const {
+    const double n = sum_weights;
+    if (n < 2) return 0.0;
+    const double numerator = l1_threshold(sum_gradient, hessian_l1);
+    // Variance term for gradients: sum_g^2 - (sum_g)^2/n
+    const double variance_term =
+        sum_squared_gradient - (sum_gradient * sum_gradient) / n;
+    const double denominator = variance_term + hessian_l2;
+    if (denominator <= 0.0) return 0.0;
+
+    if (constraints.min_max_output.has_value()) {
+      const double leaf = numerator / denominator;
+      const auto constraint_min = constraints.min_max_output.value().min;
+      const auto constraint_max = constraints.min_max_output.value().max;
+      if (leaf < constraint_min) {
+        return std::abs(constraint_min * numerator) / denominator;
+      } else if (leaf > constraint_max) {
+        return std::abs(constraint_max * numerator) / denominator;
+      }
+    }
+
+    return numerator * numerator / denominator;
+  }
+
+  // Check if the split passes the SNR threshold.
+  // Condition: mean(g)^2 > var(g) / (n - 1)
+  bool PassesSnrThreshold() const {
+    const double n = sum_weights;
+    if (n < 2) return false;
+    const double mean_g = sum_gradient / n;
+    // Sample variance: (sum_g^2 - (sum_g)^2/n) / (n - 1)
+    const double var_g =
+        (sum_squared_gradient - (sum_gradient * sum_gradient) / n) / (n - 1);
+    if (var_g <= 0.0) return true;  // No variance means pure signal
+    // Threshold: mean^2 > var / (n - 1)
+    return (mean_g * mean_g) > (var_g / (n - 1));
+  }
+
   // Leaf value without any constraint applied.
   double LeafNoConstraints() const {
     const double numerator = l1_threshold(sum_gradient, hessian_l1);
@@ -793,6 +871,7 @@ struct LabelHessianNumericalScoreAccumulator {
     sum_gradient = 0.;
     sum_hessian = 0.;
     sum_weights = 0.;
+    sum_squared_gradient = 0.;
   }
 
   template <typename T>
@@ -802,11 +881,31 @@ struct LabelHessianNumericalScoreAccumulator {
     this->sum_weights = weights;
   }
 
+  // Extended Set that includes sum of squared gradients for SNR scoring.
+  template <typename T>
+  void SetWithSquared(const T gradient, const T hessian, const T weights,
+                      const T squared_gradient) {
+    this->sum_gradient = gradient;
+    this->sum_hessian = hessian;
+    this->sum_weights = weights;
+    this->sum_squared_gradient = squared_gradient;
+  }
+
   template <typename T>
   void Add(const T gradient, const T hessian, const T weights) {
     sum_gradient += gradient;
     sum_hessian += hessian;
     sum_weights += weights;
+  }
+
+  // Extended Add that includes squared gradient for SNR scoring.
+  template <typename T>
+  void AddWithSquared(const T gradient, const T hessian, const T weights,
+                      const T squared_gradient) {
+    sum_gradient += gradient;
+    sum_hessian += hessian;
+    sum_weights += weights;
+    sum_squared_gradient += squared_gradient;
   }
 
   template <typename T>
@@ -816,9 +915,20 @@ struct LabelHessianNumericalScoreAccumulator {
     sum_weights -= weights;
   }
 
+  // Extended Sub that includes squared gradient for SNR scoring.
+  template <typename T>
+  void SubWithSquared(const T gradient, const T hessian, const T weights,
+                      const T squared_gradient) {
+    sum_gradient -= gradient;
+    sum_hessian -= hessian;
+    sum_weights -= weights;
+    sum_squared_gradient -= squared_gradient;
+  }
+
   double sum_gradient;
   double sum_hessian;
   double sum_weights;
+  double sum_squared_gradient = 0.;  // For SNR scoring
 
   // Regularization parameters.
   double hessian_l1;
